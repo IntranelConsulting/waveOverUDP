@@ -8,17 +8,13 @@
 #include <FunctionDiscoveryKeys_devpkey.h>
 #include <string>
 
-//#define AUDIO_SAMPLEPERSEC 48000
-//#define AUDIO_CHANNELS 2
-//#define AUDIO_BYTESPERSAMPLE 2
-
-//#define AUDIO_BUFFER_MSEC 10
 
 #define PACKETSIZE 16384
 
 int main(int argc, char *argv[]);
-HRESULT recordWasapi(int audioSamplePerSec, int audioChannels, int audioBytesPerSample, int audioBufferChunk, int audioBufferNum, std::string name);
+HRESULT recordWasapi(int audioSamplePerSec, int audioChannels, int audioBytesPerSample, int audioBufferChunk, int audioBufferNum, std::string name, bool forcemono, bool audioMuLaw);
 HRESULT getDefaultDevice(std::string name, IMMDevice **ppMMDevice, bool *isCapture);
+void mulaw_encode (int16_t * in, uint8_t * out, int numsamples);
 
 SOCKET connection = INVALID_SOCKET;
 SOCKADDR_IN sin_server;
@@ -39,14 +35,16 @@ int CALLBACK WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 int main(int argc, char *argv[])
 {
-	const char *ip = "127.0.0.1";
-	int port = 2305;
+	const char *ip = "192.168.1.13";
+	int port = 50000;
 	int audioSamplePerSec = 48000;
 	int audioChannels = 2;
 	int audioBytesPerSample = 2;
 	int audioBufferChunk = 240;
 	int audioBufferNum = 2;
-	std::string audioCaptureName;
+	bool audioForceMono = false;
+	bool audioMuLaw = false;
+	std::string audioCaptureName ="Microphone";
 
 	WSADATA wsadata;
 
@@ -71,11 +69,17 @@ int main(int argc, char *argv[])
 		} else if(!strcmp(argv[i], "--device") && (i+1) < argc) {
 			audioCaptureName = std::string(argv[i+1]);
 			i++;
+		} else if(!strcmp(argv[i], "--forcemono")) {
+			audioForceMono = true;
+		} else if(!strcmp(argv[i], "--ulaw")) {
+			audioMuLaw = true;
 		} else {
 			ip = argv[i];
 		}
 	}
 
+	if (audioForceMono) printf("Forcing mono\n");
+	if (audioMuLaw) printf("Using uLaw companding\n");
 	printf("Connecting to: %s:%d\n", ip, port);
 	sin_server.sin_addr.s_addr = inet_addr(ip);
 	sin_server.sin_family = AF_INET;
@@ -83,7 +87,7 @@ int main(int argc, char *argv[])
 
 	if((connection = socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET)
 	{
-		MessageBox(NULL, "Erreur Winsock", "NetSound", MB_OK);
+		MessageBox(NULL, "Error Winsock", "NetSound", MB_OK);
 		return -1;
 	}
 
@@ -96,7 +100,7 @@ int main(int argc, char *argv[])
 	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 	SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
 
-	int errcode = recordWasapi(audioSamplePerSec, audioChannels, audioBytesPerSample, audioBufferChunk, audioBufferNum, audioCaptureName);
+	int errcode = recordWasapi(audioSamplePerSec, audioChannels, audioBytesPerSample, audioBufferChunk, audioBufferNum, audioCaptureName, audioForceMono, audioMuLaw);
 	if(errcode) {
 		_com_error err(errcode);
 		LPCTSTR errMsg = err.ErrorMessage();
@@ -139,7 +143,7 @@ const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
 const IID IID_IAudioClient = __uuidof(IAudioClient);
 const IID IID_IAudioCaptureClient = __uuidof(IAudioCaptureClient);
 
-HRESULT recordWasapi(int audioSamplePerSec, int audioChannels, int audioBytesPerSample, int audioBufferChunk, int audioBufferNum, std::string name)
+HRESULT recordWasapi(int audioSamplePerSec, int audioChannels, int audioBytesPerSample, int audioBufferChunk, int audioBufferNum, std::string name, bool audioForceMono, bool audioMuLaw)
 {
 	HRESULT hr;
 	UINT32 bufferFrameCount;
@@ -219,14 +223,38 @@ HRESULT recordWasapi(int audioSamplePerSec, int audioChannels, int audioBytesPer
 			hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
 			EXIT_ON_ERROR(hr)
 
-			char* sendBuffer;
 			UINT32 bufferBytes = numFramesAvailable * pFormat.nBlockAlign;
-			sendBuffer = new char[bufferBytes];
+			if(audioForceMono) bufferBytes = bufferBytes / audioChannels;
+			uint8_t *sendBuffer = new uint8_t[bufferBytes];
 
 			if(flags & AUDCLNT_BUFFERFLAGS_SILENT)
 				memset(sendBuffer, 0, bufferBytes);
-			else
-				memcpy(sendBuffer, pData, bufferBytes);
+			else {
+				if(audioForceMono){
+					uint8_t* sendBufferIn = sendBuffer;
+					uint8_t* pDataOut = pData;
+					// Copy even numbered samples to out buffer
+					for (size_t i = 0; i < numFramesAvailable; i++)
+					{
+						for (size_t j = 0; j < audioBytesPerSample; j++)
+						{
+							*(sendBufferIn + j) = *(pDataOut + j);
+						}
+						sendBufferIn += audioBytesPerSample;
+						pDataOut += pFormat.nBlockAlign;
+					}
+				}
+				else {
+					memcpy(sendBuffer, pData, bufferBytes);
+				}
+			}
+
+			if(audioMuLaw && audioBytesPerSample == 2){
+				int16_t *inPointer = (int16_t *)sendBuffer;
+				uint8_t *outPointer = sendBuffer;
+				bufferBytes = bufferBytes/audioBytesPerSample; 
+				mulaw_encode(inPointer, outPointer, bufferBytes);
+			}
 
 			hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
 			EXIT_ON_ERROR(hr)
@@ -355,4 +383,56 @@ Exit:
 	SAFE_RELEASE(pMMDeviceEnumerator)
 
 	return hr;
+}
+
+#undef ZEROTRAP                 /* turn on the trap as per the MIL-STD */
+#define BIAS 0x84               /* define the add-in bias for 16 bit samples */
+#define CLIP 32635
+
+void mulaw_encode (int16_t * in, uint8_t * out, int numsamples)
+{
+  static int16_t exp_lut[256] = { 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
+  };
+  int16_t sign, exponent, mantissa, i;
+  int16_t sample;
+  uint8_t ulawbyte;
+
+  for (i = 0; i < numsamples; i++) {
+    sample = in[i];
+      /** get the sample into sign-magnitude **/
+    sign = (sample >> 8) & 0x80;        /* set aside the sign */
+    if (sign != 0) {
+      sample = -sample;         /* get magnitude */
+    }
+    /* sample can be zero because we can overflow in the inversion,
+     * checking against the unsigned version solves this */
+    if (((uint16_t) sample) > CLIP)
+      sample = CLIP;            /* clip the magnitude */
+
+      /** convert from 16 bit linear to ulaw **/
+    sample = sample + BIAS;
+    exponent = exp_lut[(sample >> 7) & 0xFF];
+    mantissa = (sample >> (exponent + 3)) & 0x0F;
+    ulawbyte = ~(sign | (exponent << 4) | mantissa);
+#ifdef ZEROTRAP
+    if (ulawbyte == 0)
+      ulawbyte = 0x02;          /* optional CCITT trap */
+#endif
+    out[i] = ulawbyte;
+  }
 }
